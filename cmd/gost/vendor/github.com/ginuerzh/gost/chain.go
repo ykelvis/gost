@@ -5,7 +5,9 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
+	"github.com/ginuerzh/pht"
 	"github.com/golang/glog"
+	"github.com/lucas-clemente/quic-go/h2quic"
 	"golang.org/x/net/http2"
 	"io"
 	"net"
@@ -29,6 +31,8 @@ type ProxyChain struct {
 	kcpConfig      *KCPConfig
 	kcpSession     *KCPSession
 	kcpMutex       sync.Mutex
+	phtClient      *pht.Client
+	quicClient     *http.Client
 }
 
 func NewProxyChain(nodes ...ProxyNode) *ProxyChain {
@@ -96,8 +100,8 @@ func (c *ProxyChain) Init() {
 	}
 
 	for i, node := range c.nodes {
-		if node.Transport == "kcp" && i > 0 {
-			glog.Fatal("KCP must be the first node in the proxy chain")
+		if (node.Transport == "kcp" || node.Transport == "pht" || node.Transport == "quic") && i > 0 {
+			glog.Fatal("KCP/PHT/QUIC must be the first node in the proxy chain")
 		}
 	}
 
@@ -116,7 +120,27 @@ func (c *ProxyChain) Init() {
 			config.Key, _ = c.nodes[0].Users[0].Password()
 		}
 		c.kcpConfig = config
+		go snmpLogger(config.SnmpLog, config.SnmpPeriod)
+		go kcpSigHandler()
+
 		return
+	}
+
+	if c.nodes[0].Transport == "quic" {
+		glog.V(LINFO).Infoln("QUIC is enabled")
+		c.quicClient = &http.Client{
+			Transport: &h2quic.QuicRoundTripper{
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: c.nodes[0].insecureSkipVerify(),
+					ServerName:         c.nodes[0].serverName,
+				},
+			},
+		}
+	}
+
+	if c.nodes[0].Transport == "pht" {
+		glog.V(LINFO).Infoln("Pure HTTP mode is enabled")
+		c.phtClient = pht.NewClient(c.nodes[0].Addr, c.nodes[0].Get("key"))
 	}
 }
 
@@ -242,6 +266,12 @@ func (c *ProxyChain) dialWithNodes(withHttp2 bool, addr string, nodes ...ProxyNo
 			return c.http2Connect(addr)
 		}
 	}
+
+	if nodes[0].Transport == "quic" {
+		glog.V(LINFO).Infoln("Dial with QUIC")
+		return c.quicConnect(addr)
+	}
+
 	pc, err := c.travelNodes(withHttp2, nodes...)
 	if err != nil {
 		return
@@ -269,6 +299,8 @@ func (c *ProxyChain) travelNodes(withHttp2 bool, nodes ...ProxyNode) (conn *Prox
 		cc, err = c.http2Connect(node.Addr)
 	} else if node.Transport == "kcp" {
 		cc, err = c.getKCPConn()
+	} else if node.Transport == "pht" {
+		cc, err = c.phtClient.Dial()
 	} else {
 		cc, err = net.DialTimeout("tcp", node.Addr, DialTimeout)
 	}
@@ -378,4 +410,64 @@ func (c *ProxyChain) http2Connect(addr string) (net.Conn, error) {
 			"Basic "+base64.StdEncoding.EncodeToString([]byte(http2Node.Users[0].String())))
 	}
 	return c.getHttp2Conn(header)
+}
+
+func (c *ProxyChain) quicConnect(addr string) (net.Conn, error) {
+	quicNode := c.nodes[0]
+	header := make(http.Header)
+	header.Set("Gost-Target", addr) // Flag header to indicate the address that server connected to
+	if quicNode.Users != nil {
+		header.Set("Proxy-Authorization",
+			"Basic "+base64.StdEncoding.EncodeToString([]byte(quicNode.Users[0].String())))
+	}
+	return c.getQuicConn(header)
+}
+
+func (c *ProxyChain) getQuicConn(header http.Header) (net.Conn, error) {
+	quicNode := c.nodes[0]
+	pr, pw := io.Pipe()
+
+	if header == nil {
+		header = make(http.Header)
+	}
+
+	/*
+		req := http.Request{
+			Method:        http.MethodGet,
+			URL:           &url.URL{Scheme: "https", Host: quicNode.Addr},
+			Header:        header,
+			Proto:         "HTTP/2.0",
+			ProtoMajor:    2,
+			ProtoMinor:    0,
+			Body:          pr,
+			Host:          quicNode.Addr,
+			ContentLength: -1,
+		}
+	*/
+	req, err := http.NewRequest(http.MethodPost, "https://"+quicNode.Addr, pr)
+	if err != nil {
+		return nil, err
+	}
+	req.ContentLength = -1
+	req.Header = header
+
+	if glog.V(LDEBUG) {
+		dump, _ := httputil.DumpRequest(req, false)
+		glog.Infoln(string(dump))
+	}
+	resp, err := c.quicClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if glog.V(LDEBUG) {
+		dump, _ := httputil.DumpResponse(resp, false)
+		glog.Infoln(string(dump))
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, errors.New(resp.Status)
+	}
+	conn := &http2Conn{r: resp.Body, w: pw}
+	conn.remoteAddr, _ = net.ResolveUDPAddr("udp", quicNode.Addr)
+	return conn, nil
 }
